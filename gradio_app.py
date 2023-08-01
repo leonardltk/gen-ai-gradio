@@ -237,7 +237,6 @@ class ImageGeneration():
         print(colored(f'time taken to run inference = {time.time() - start_time}', 'yellow'))
         return pil_image
 
-@debug_on_error
 class ChatModel():
     def __init__(self, 
                  model_name, 
@@ -249,11 +248,12 @@ class ChatModel():
         self.max_length = 1024
         self.top_p = 0.95
         self.repetition_penalty = 1.15
+        self.system_prompt = "You are a chatbot. Answer the question in a helpful manner. If you don't know the answer, just say that you don't know, don't try to make up an answer."
 
         # chat history memory
         self.chat_history = []
-        self.total_citation_dict = {}
 
+        # load model
         self.load_model()
 
     def load_model(self):
@@ -276,9 +276,41 @@ class ChatModel():
 
         self.local_llm = HuggingFacePipeline(pipeline=self.pipe)
 
-
     def respond(self, user_input, dummy_chat_history):
-        print(colored(f'\ndummy_chat_history = {dummy_chat_history}\n', 'red'))
+        # Prepare chat history prompt template
+        if len(self.chat_history):
+            # chat_history_string = self.process_chat_history()
+            chat_history_string = '\n'.join([ f'Human: {human_response}\nAssistant: {agent_response}' for human_response, agent_response in self.chat_history])
+            chat_history_prompt = f"""
+If there are relevant context to use in the chat history, use it to reply the user.
+Refer to the chat history denoted by triple backticks.
+
+Chat History:
+```
+{chat_history_string}
+```
+"""
+        else:
+            chat_history_prompt = ""
+
+        # Construct prompt
+        prompt = f"""{self.system_prompt}
+{chat_history_prompt}
+Question: {user_input}
+Helpful Answer:"""
+
+        # Get response
+        print(colored(f'prompt = {prompt}', 'blue'))
+        LLM_response = self.local_llm(prompt)
+        print(colored(f'LLM_response = {LLM_response}', 'yellow'))
+
+        # Update chat history
+        self.chat_history.append((user_input, LLM_response))
+
+        return "", self.chat_history
+
+    def respond_with_options(self, user_input, dummy_chat_history, system_prompt, temperature):
+        system_prompt = f"{system_prompt}"
         # Prepare chat history prompt template
         if len(self.chat_history):
             # chat_history_string = self.process_chat_history()
@@ -296,14 +328,14 @@ Chat History:
             chat_history_prompt = ""
         
         # Construct prompt 
-        prompt = f"""You are a chatbot. Answer the question in a helpful manner. If you don't know the answer, just say that you don't know, don't try to make up an answer.
+        prompt = f"""{system_prompt}
 {chat_history_prompt}
 Question: {user_input}
 Helpful Answer:"""
 
         # Get response
         print(colored(f'prompt = {prompt}', 'blue'))
-        LLM_response = self.local_llm(prompt)
+        LLM_response = self.local_llm(prompt, temperature=temperature)
         print(colored(f'LLM_response = {LLM_response}', 'yellow'))
 
         # Update chat history
@@ -532,7 +564,6 @@ def main(args):
             msg.submit(chat_bot.respond, inputs=[msg, chatbot], outputs=[msg, chatbot]) # Press enter to submit
 
         # more features
-        """
         with gr.Blocks() as demo:
             # chat history
             chatbot = gr.Chatbot(height=400)
@@ -550,9 +581,12 @@ def main(args):
             clear = gr.ClearButton(components=[msg, chatbot],
                                    value="Clear console")
 
-            btn.click(chat_bot.respond, inputs=[msg, chatbot, system_prompt, temperature], outputs=[msg, chatbot])
-            msg.submit(chat_bot.respond, inputs=[msg, chatbot, system_prompt, temperature], outputs=[msg, chatbot]) # Press enter to submit
-        """
+            btn.click(chat_bot.respond_with_options,
+                      inputs=[msg, chatbot, system_prompt, temperature],
+                      outputs=[msg, chatbot])
+            msg.submit(chat_bot.respond_with_options,
+                       inputs=[msg, chatbot, system_prompt, temperature],
+                       outputs=[msg, chatbot]) # Press enter to submit
 
     # Gradio Launch
     demo.launch(server_port=5004,
