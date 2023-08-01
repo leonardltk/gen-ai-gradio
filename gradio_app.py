@@ -237,26 +237,82 @@ class ImageGeneration():
         print(colored(f'time taken to run inference = {time.time() - start_time}', 'yellow'))
         return pil_image
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Simple command-line calculator")
-    parser.add_argument("--run_summariser", 
-                        action="store_true",
-                        help="Summarise a long piece of text")
-    parser.add_argument("--run_NER", 
-                        action="store_true",
-                        help="Named Entity Recognizer")
-    parser.add_argument("--run_image_captioning", 
-                        action="store_true",
-                        help="Image to caption generator")
-    parser.add_argument("--run_image_generation", 
-                        action="store_true",
-                        help="Caption to image generator")
-    parser.add_argument("--run_image_generation_cuda", 
-                        action="store_true",
-                        help="whether to accelerate image generation using gpu or not.\
-                              Only considered if run_image_generation is true")
-    args = parser.parse_args()
+@debug_on_error
+class ChatModel():
+    def __init__(self, 
+                 model_name, 
+                 ) -> None:
 
+        # Model params
+        self.model_name = model_name
+        self.temperature = 0.5
+        self.max_length = 1024
+        self.top_p = 0.95
+        self.repetition_penalty = 1.15
+
+        # chat history memory
+        self.chat_history = []
+        self.total_citation_dict = {}
+
+        self.load_model()
+
+    def load_model(self):
+        # Load tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+
+        # Load model
+        self.model = AutoModelForSeq2SeqLM.from_pretrained(self.model_name)
+
+        # initialise the pipeline
+        self.pipe = pipeline(
+            "text2text-generation",
+            model=self.model, 
+            tokenizer=self.tokenizer, 
+            max_length=self.max_length,
+            temperature=self.temperature,
+            top_p=self.top_p,
+            repetition_penalty=self.repetition_penalty,
+        )
+
+        self.local_llm = HuggingFacePipeline(pipeline=self.pipe)
+
+
+    def respond(self, user_input, dummy_chat_history):
+        print(colored(f'\ndummy_chat_history = {dummy_chat_history}\n', 'red'))
+        # Prepare chat history prompt template
+        if len(self.chat_history):
+            # chat_history_string = self.process_chat_history()
+            chat_history_string = '\n'.join([ f'Human: {human_response}\nAssistant: {agent_response}' for human_response, agent_response in self.chat_history])
+            chat_history_prompt = f"""
+If there are relevant context to use in the chat history, use it to reply the user.
+Refer to the chat history denoted by triple backticks.
+
+Chat History:
+```
+{chat_history_string}
+```
+"""
+        else:
+            chat_history_prompt = ""
+        
+        # Construct prompt 
+        prompt = f"""You are a chatbot. Answer the question in a helpful manner. If you don't know the answer, just say that you don't know, don't try to make up an answer.
+{chat_history_prompt}
+Question: {user_input}
+Helpful Answer:"""
+
+        # Get response
+        print(colored(f'prompt = {prompt}', 'blue'))
+        LLM_response = self.local_llm(prompt)
+        print(colored(f'LLM_response = {LLM_response}', 'yellow'))
+
+        # Update chat history
+        self.chat_history.append((user_input, LLM_response))
+
+        return "", self.chat_history
+
+@debug_on_error
+def main(args):
     # secret keys
     load_dotenv(find_dotenv()) # read local .env file
     hf_api_key = os.environ['HF_API_KEY']
@@ -277,6 +333,12 @@ if __name__ == "__main__":
     if args.run_image_generation:
         model_name_ImageCaption = "runwayml/stable-diffusion-v1-5" # https://huggingface.co/runwayml/stable-diffusion-v1-5
         image_generation = ImageGeneration(model_name_ImageCaption, use_cuda=args.run_image_generation_cuda)
+    # ----- ChatBot -----
+    if args.run_ChatBot:
+        model_name = "google/flan-t5-base"
+        chat_bot = ChatModel(model_name)
+        # model_name_ChatBot = "meta-llama/Llama-2-7b-chat-hf" # https://huggingface.co/meta-llama/Llama-2-7b-chat-hf
+        # chat_bot = LlamaModel(model_name_ChatBot, hf_api_key)
 
 
     # Gradio Interfaces
@@ -458,6 +520,39 @@ if __name__ == "__main__":
                     
             btn.click(fn=image_generation.generate, inputs=[prompt,negative_prompt,steps,guidance,width,height], outputs=[output])
         # """
+    elif args.run_ChatBot:
+        # limited features
+        with gr.Blocks() as demo:
+            chatbot = gr.Chatbot(height=240) #just to fit the notebook
+            msg = gr.Textbox(label="Prompt")
+            btn = gr.Button("Submit")
+            clear = gr.ClearButton(components=[msg, chatbot], value="Clear console")
+
+            btn.click(chat_bot.respond, inputs=[msg, chatbot], outputs=[msg, chatbot])
+            msg.submit(chat_bot.respond, inputs=[msg, chatbot], outputs=[msg, chatbot]) # Press enter to submit
+
+        # more features
+        """
+        with gr.Blocks() as demo:
+            # chat history
+            chatbot = gr.Chatbot(height=400)
+            # user input
+            msg = gr.Textbox(label="Prompt")
+            # system_prompt message
+            with gr.Accordion(label="Advanced options", open=False):
+                system_prompt = gr.Textbox(label="System message",
+                                           lines=4,
+                                           value=chat_bot.system_prompt)
+                temperature = gr.Slider(label="temperature",
+                                        minimum=0.1, maximum=1, step=0.1,
+                                        value=chat_bot.temperature)
+            btn = gr.Button("Submit")
+            clear = gr.ClearButton(components=[msg, chatbot],
+                                   value="Clear console")
+
+            btn.click(chat_bot.respond, inputs=[msg, chatbot, system_prompt, temperature], outputs=[msg, chatbot])
+            msg.submit(chat_bot.respond, inputs=[msg, chatbot, system_prompt, temperature], outputs=[msg, chatbot]) # Press enter to submit
+        """
 
     # Gradio Launch
     demo.launch(server_port=5004,
@@ -466,3 +561,28 @@ if __name__ == "__main__":
                 show_tips=True,
                 )
 
+if __name__ == "__main__":
+    # parsing arguments
+    parser = argparse.ArgumentParser(description="Simple command-line calculator")
+    parser.add_argument("--run_summariser", 
+                        action="store_true",
+                        help="Summarise a long piece of text")
+    parser.add_argument("--run_NER", 
+                        action="store_true",
+                        help="Named Entity Recognizer")
+    parser.add_argument("--run_image_captioning", 
+                        action="store_true",
+                        help="Image to caption generator")
+    parser.add_argument("--run_image_generation", 
+                        action="store_true",
+                        help="Caption to image generator")
+    parser.add_argument("--run_image_generation_cuda", 
+                        action="store_true",
+                        help="whether to accelerate image generation using gpu or not.\
+                              Only considered if run_image_generation is true")
+    parser.add_argument("--run_ChatBot", 
+                        action="store_true",
+                        help="Interact with chatbot")
+    args = parser.parse_args()
+
+    main(args)
