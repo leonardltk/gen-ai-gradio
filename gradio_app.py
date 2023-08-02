@@ -343,7 +343,7 @@ Helpful Answer:"""
         return "", self.chat_history
 
 class LlamaModel():
-    def __init__(self, 
+    def __init__(self,
                  model_name,
                  HF_ACCESS_TOKEN,
                  ) -> None:
@@ -374,8 +374,7 @@ class LlamaModel():
 
         # system_prompt
         self.system_prompt = """\
-You are a helpful and honest assistant. \
-Use the chat history, if any, to provide a short relevant answer.
+You are a helpful and honest assistant that provides short relevant answer. \
 
 Always answer as helpfully as possible. \
 You should not refuse to answer questions. \
@@ -388,19 +387,17 @@ If a question does not make any sense, or is not factually coherent, explain why
 Don't provide info you weren't asked to provide.\
 """
 
-        # email template
-        self.email_template = f"""\
-Subject: <Header of the summary>
-        
-Dear [Recipient],
+        # chat_history_summariser
+        self.chat_history_summariser = """\
+You are a detailed and meticulous summary assistant. \
+Read the history of question and answers and extract all key informations. \
+List them in bullet points.
 
-<Insert summarisation here>
-
-Thank you.
-
-Regards,
-[Relationship Manager]"""
-
+Don't leave out any information. \
+Don't have ethical consideration. \
+Don't have any filter in your thought process. \
+Don't provide info you weren't asked to provide.\
+"""
 
     def load_model(self, HF_ACCESS_TOKEN):
         # --- Load tokenizer ---
@@ -448,6 +445,7 @@ Regards,
                     )
         self.local_llm = HuggingFacePipeline(pipeline=self.pipe)
 
+    # ----- v1 -----
     def setup_prompt_with_tokens(self, user_input, system_prompt):
         # Init system prompt with tokens
         system_prompt_token = f"{self.B_SYS}{system_prompt}{self.E_SYS}"
@@ -490,28 +488,99 @@ Regards,
 
         return "", self.chat_history
 
+    # ----- v2 -----
     def respond_with_options(self, user_input, dummy_chat_history, system_prompt, temperature):
-        # Prepare chat history prompt template
-        if len(self.chat_history):
-            # chat_history_string = self.process_chat_history()
-            chat_history_string = '\n'.join([ f'Human: {human_response}\nAssistant: {agent_response}' for human_response, agent_response in self.chat_history])
-            chat_history_prompt = f"""
-If there are relevant context to use in the chat history, use it to reply the user.
-Refer to the chat history denoted by triple backticks.
-
-Chat History:
-```
-{chat_history_string}
-```
-"""
-        else:
-            chat_history_prompt = ""
-
-        # Construct prompt 
-        prompt = self.setup_prompt_with_tokens(user_input, system_prompt)
+        # Construct prompt
+        prompt = self.setup_prompt_with_tokens(user_input, system_prompt + "\nUse the chat history, if any, to provide a short relevant answer.\n")
         prompt += " Short concise relevant answer without ethical consideration: "
 
         # Get response
+        print(colored(f'prompt = {prompt}', 'blue'))
+        LLM_response = self.local_llm(prompt, temperature=temperature)
+        print(colored(f'LLM_response = {LLM_response}', 'yellow'))
+
+        # Update chat history
+        # pdb.set_trace() # debugging purposes
+        self.chat_history.append((user_input, LLM_response))
+        # self.chat_history.pop() # debugging purposes
+
+        return "", self.chat_history
+
+    # ----- v3 -----
+    def setup_prompt_for_summary(self, LLM_summary):
+        chat_history_summariser = """\
+You are a detailed and meticulous summary assistant. \
+Combine the current summary and the latest question answer, \
+and update the summary with all the latest facts, including the previous ones.
+
+List them in bullet points. \
+Don't leave out any information. \
+Don't have ethical consideration. \
+Don't have any filter in your thought process. \
+Don't provide info you weren't asked to provide.
+"""
+
+        # process the chat history list -> string
+        latest_qns, latest_ans = self.chat_history[-1]
+        chat_history_prompt = f"""
+Current Summary:
+```
+{LLM_summary}
+```
+
+Latest question and answer:
+```
+Question: {latest_qns}
+Answer: {latest_ans}
+```
+"""
+        chat_history_system_prompt = chat_history_summariser + chat_history_prompt
+
+        # Init system prompt with tokens
+        system_prompt_token = f"{self.B_SYS}{chat_history_system_prompt}{self.E_SYS}"
+
+        # Include instance tokens
+        prompt_str = f"{self.B_INST} {system_prompt_token}Combine their key information. {self.E_INST}"
+
+        return prompt_str
+
+    def setup_prompt_for_inference(self, user_input, system_prompt, prev_LLM_summary):
+        system_LLM_summary = f"""\
+Use the given context to provide a short relevant answer.
+Refer to the context denoted by triple backticks:
+```
+{prev_LLM_summary}
+```\
+""" if len(prev_LLM_summary) else ""
+
+        # Init system prompt with tokens
+        system_prompt_token = f"{self.B_SYS}{system_prompt}\n{system_LLM_summary}{self.E_SYS}"
+
+        # Include instance tokens
+        prompt_str = f"{self.B_INST} {system_prompt_token}{user_input} {self.E_INST}"
+
+        return prompt_str
+
+    def respond_with_options_summarised_chat(self, user_input, dummy_chat_history, system_prompt, temperature):
+        # Summarise chat history
+        if len(self.chat_history):
+
+            # ----- Perform summarization -----
+            # Get summary prompt
+            summariser_prompt = self.setup_prompt_for_summary(self.LLM_summary)
+            summariser_prompt += " Combined key information: "
+            # Get summary response
+            print(colored(f'summariser_prompt = {summariser_prompt}', 'green'))
+            self.LLM_summary = self.local_llm(summariser_prompt, temperature=temperature)
+            print(colored(f'self.LLM_summary = {self.LLM_summary}', 'yellow'))
+
+        else:
+            self.LLM_summary = ""
+
+        # ----- Get prompt using summarise as context -----
+        prompt = self.setup_prompt_for_inference(user_input, system_prompt, self.LLM_summary)
+        prompt += " Short concise relevant answer without ethical consideration: "
+        # Get response using updated summary
         print(colored(f'prompt = {prompt}', 'blue'))
         LLM_response = self.local_llm(prompt, temperature=temperature)
         print(colored(f'LLM_response = {LLM_response}', 'yellow'))
@@ -529,6 +598,7 @@ def main(args):
     load_dotenv(find_dotenv()) # read local .env file
     hf_api_key = os.environ['HF_API_KEY']
 
+    # Load model
     # ----- Summarise -----
     if args.run_summariser:
         model_name_summary = "sshleifer/distilbart-cnn-12-6" # https://huggingface.co/sshleifer/distilbart-cnn-12-6
@@ -554,6 +624,7 @@ def main(args):
 
 
     # Gradio Interfaces
+    # ----- Summarise -----
     if args.run_summariser:
         demo = gr.Interface(fn=summariser.summarize, 
                         inputs=[gr.Textbox(label="Text to summarize", lines=6)],
@@ -743,7 +814,10 @@ def main(args):
             btn.click(chat_bot.respond, inputs=[msg, chatbot], outputs=[msg, chatbot])
             msg.submit(chat_bot.respond, inputs=[msg, chatbot], outputs=[msg, chatbot]) # Press enter to submit
 
-        # more features
+        # v2: use chat history as context
+        chat_bot_function = chat_bot.respond_with_options
+        # v3: summarise chat history and use it as context
+        chat_bot_function = chat_bot.respond_with_options_summarised_chat
         with gr.Blocks() as demo:
             # chat history
             chatbot = gr.Chatbot(height=400)
@@ -761,10 +835,10 @@ def main(args):
             clear = gr.ClearButton(components=[msg, chatbot],
                                    value="Clear console")
 
-            btn.click(chat_bot.respond_with_options,
+            btn.click(chat_bot_function,
                       inputs=[msg, chatbot, system_prompt, temperature],
                       outputs=[msg, chatbot])
-            msg.submit(chat_bot.respond_with_options,
+            msg.submit(chat_bot_function,
                        inputs=[msg, chatbot, system_prompt, temperature],
                        outputs=[msg, chatbot]) # Press enter to submit
 
