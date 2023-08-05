@@ -16,7 +16,15 @@ import torch
 from torch import cuda, bfloat16
 from PIL import Image
 
+import langchain
+from langchain import OpenAI, LLMChain, PromptTemplate
+from langchain.llms import OpenAI
 from langchain.llms import HuggingFacePipeline
+from langchain.agents import ZeroShotAgent, AgentExecutor
+from langchain.tools import tool
+from langchain.tools.python.tool import PythonREPLTool
+from langchain.memory import ConversationBufferMemory
+
 import transformers
 from transformers import pipeline
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForTokenClassification, TextStreamer
@@ -237,6 +245,177 @@ class ImageGeneration():
         print(colored(f'time taken to run inference = {time.time() - start_time}', 'yellow'))
         return pil_image
 
+
+class OpenAIModel():
+    def __init__(self, model_name, ) -> None:
+
+        os.environ["OPENAI_API_KEY"]
+
+        # Model params
+        self.model_name = model_name
+        self.temperature = 0.5
+
+        # chat history memory
+        self.chat_history = []
+
+        # load model
+        self.load_tools()
+        self.load_agent_prompt()
+        self.load_model()
+
+        # load model
+        self.system_prompt = self.agent_chain.agent.llm_chain.prompt.template
+
+    def load_tools(self):
+        # https://python.langchain.com/docs/modules/agents/tools/custom_tools#using-the-tool-decorator
+
+        # --- standard_response tool ---
+        @tool(return_direct=True)
+        def standard_response(query: str) -> str:
+            """ """
+            query_with_context = f"""\
+Reply the user with a friendly manner.
+User: {query}\
+"""
+            search_result = self.llm_text_model.predict(query_with_context)
+            return search_result
+        standard_response.description = """\
+If the user's request is not a question, \
+or just requires a standard response, \
+give a standard reply.\
+"""
+
+        # --- question_answer tool ---
+        @tool(return_direct=True)
+        def question_answer(question_to_user: str) -> str:
+            """ """
+            return question_to_user
+        question_answer.description = """\
+If the user's request requires information that is not found in the chat history, \
+ask them to provide the information to you, \
+instead of hallucinating the output.\
+"""
+
+        # --- RePL tool ---
+        python_RePL_tool = PythonREPLTool()
+        python_RePL_tool.description = """A Python shell. \
+Use this to execute python commands. \
+Input should be a valid python command. \
+Denote the python command with triple backticks. \
+If you want to see the output of a value, you should print it out with `print(...)`.\
+"""
+
+
+        # ------ Combine these tools ------
+        self.tools_lst = [standard_response, question_answer, python_RePL_tool]
+        self.tool_descriptions = "\n\n".join([f"{i.name}: {i.description}" for i in self.tools_lst])
+        # print(colored(self.tool_descriptions, 'blue'))
+
+    def load_agent_prompt(self):
+        template = """\
+Have a conversation with a human, answering the following questions as best you can. \
+Find relevant information from the chat history if required. \
+Do not use any information that the user did not provide.
+"""
+
+        template += f"""
+You have access to the following tools:
+```
+{self.tool_descriptions}
+```
+"""
+
+        template += """
+Use the following format:
+```
+Question: the input question you must answer
+Thought: you should always think about what to do
+Action: the action to take, should be one of [standard_response, human, Python_REPL]
+Action Input: the input to the action
+Observation: the result of the action
+... (this Thought/Action/Action Input/Observation can repeat N times)
+Thought: I now know the final answer
+Final Answer: the final answer to the original input question
+```
+"""
+
+        template += """
+Begin!
+
+Previous conversation history
+```
+{chat_history}
+```
+
+New question: {input}
+Thought: {agent_scratchpad}\
+"""
+
+        # print(colored(template, 'blue'))
+        # pdb.set_trace()
+
+        self.prompt = PromptTemplate.from_template(template)
+
+    def load_model(self):
+        # Load tokenizer
+        memory = ConversationBufferMemory(memory_key="chat_history")
+
+        # Load model
+        self.llm_text_model = OpenAI(temperature=0.5)
+
+        llm_chain = LLMChain(llm=self.llm_text_model,
+                             prompt=self.prompt)
+
+        # initialise the pipeline
+        agent = ZeroShotAgent(llm_chain=llm_chain,
+                            tools=self.tools_lst,
+                            verbose=True)
+        self.agent_chain = AgentExecutor.from_agent_and_tools(agent=agent,
+                                                              tools=self.tools_lst,
+                                                              verbose=True,
+                                                              memory=memory
+        )
+
+        # example of how to run the sequence with look back on memory
+        # self.agent_chain.run("hi")
+        # self.agent_chain.run("my name is leonard")
+        # self.agent_chain.run("whats my name ?")
+        # self.agent_chain.run("whats my age ?")
+        # self.agent_chain.run("whats my age ?")
+        # self.agent_chain.run("whats my age multiplied by 5 ?")
+        # self.agent_chain.run("whats my wife's age multiplied by 5 ?")
+        # self.agent_chain.run("whats my wife's age ?")
+        # self.agent_chain.run("why do you think so ?")
+        # self.agent_chain.run("Summarise our chat history please")
+        # self.agent_chain.run("what is our combined age divided by 8 ?")
+        # pdb.set_trace()
+
+    # ----- v1 -----
+    def respond(self, user_input, dummy_chat_history):
+
+        # inference
+        LLM_response = self.agent_chain.run(user_input)
+
+        # Update chat history
+        # pdb.set_trace() # debugging purposes
+        self.chat_history.append((user_input, LLM_response))
+        # self.chat_history.pop() # debugging purposes
+
+        return "", self.chat_history
+
+    # ----- v3 -----
+    def respond_with_options_ReAct(self, user_input, dummy_chat_history, system_prompt, temperature):
+
+        # inference
+        LLM_response = self.agent_chain.run(user_input)
+
+        # Update chat history
+        # pdb.set_trace() # debugging purposes
+        self.chat_history.append((user_input, LLM_response))
+        # self.chat_history.pop() # debugging purposes
+
+        return "", self.chat_history
+
 class ChatModel():
     def __init__(self, 
                  model_name, 
@@ -276,6 +455,7 @@ class ChatModel():
 
         self.local_llm = HuggingFacePipeline(pipeline=self.pipe)
 
+    # ----- v1 -----
     def respond(self, user_input, dummy_chat_history):
         # Prepare chat history prompt template
         if len(self.chat_history):
@@ -309,6 +489,7 @@ Helpful Answer:"""
 
         return "", self.chat_history
 
+    # ----- v2 -----
     def respond_with_options(self, user_input, dummy_chat_history, system_prompt, temperature):
         # Prepare chat history prompt template
         if len(self.chat_history):
@@ -342,10 +523,15 @@ Helpful Answer:"""
 
         return "", self.chat_history
 
+    # ----- v3 -----
+    # did not test on this chat model
+
+    # ----- v4 -----
+    # Does not work with google FLAN T5
+
 class LlamaModel():
     def __init__(self,
                  model_name,
-                 HF_ACCESS_TOKEN,
                  ) -> None:
 
         # Model params
@@ -365,7 +551,7 @@ class LlamaModel():
         self.chat_history = []
 
         # load model
-        self.load_model(HF_ACCESS_TOKEN)
+        self.load_model(os.environ['HF_API_KEY'])
 
     def init_prompts(self):
         # tokenizers
@@ -592,11 +778,11 @@ Refer to the context denoted by triple backticks:
 
         return "", self.chat_history
 
+
 @debug_on_error
 def main(args):
     # secret keys
     load_dotenv(find_dotenv()) # read local .env file
-    hf_api_key = os.environ['HF_API_KEY']
 
     # Load model
     # ----- Summarise -----
@@ -618,9 +804,11 @@ def main(args):
     # ----- ChatBot -----
     if args.run_ChatBot:
         model_name = "google/flan-t5-base"
-        chat_bot = ChatModel(model_name)
-        model_name_ChatBot = "meta-llama/Llama-2-7b-chat-hf" # https://huggingface.co/meta-llama/Llama-2-7b-chat-hf
-        chat_bot = LlamaModel(model_name_ChatBot, hf_api_key)
+        chat_bot = OpenAIModel(model_name)
+        # model_name = "google/flan-t5-base"
+        # chat_bot = ChatModel(model_name)
+        # model_name_ChatBot = "meta-llama/Llama-2-7b-chat-hf" # https://huggingface.co/meta-llama/Llama-2-7b-chat-hf
+        # chat_bot = LlamaModel(model_name_ChatBot)
 
 
     # Gradio Interfaces
@@ -804,7 +992,7 @@ def main(args):
             btn.click(fn=image_generation.generate, inputs=[prompt,negative_prompt,steps,guidance,width,height], outputs=[output])
         # """
     elif args.run_ChatBot:
-        # limited features
+        # v1: limited features
         with gr.Blocks() as demo:
             chatbot = gr.Chatbot(height=240) #just to fit the notebook
             msg = gr.Textbox(label="Prompt")
@@ -815,9 +1003,11 @@ def main(args):
             msg.submit(chat_bot.respond, inputs=[msg, chatbot], outputs=[msg, chatbot]) # Press enter to submit
 
         # v2: use chat history as context
-        chat_bot_function = chat_bot.respond_with_options
+        # chat_bot_function = chat_bot.respond_with_options
         # v3: summarise chat history and use it as context
-        chat_bot_function = chat_bot.respond_with_options_summarised_chat
+        # chat_bot_function = chat_bot.respond_with_options_summarised_chat
+        # v4: Use ReAct
+        chat_bot_function = chat_bot.respond_with_options_ReAct
         with gr.Blocks() as demo:
             # chat history
             chatbot = gr.Chatbot(height=400)
@@ -849,6 +1039,7 @@ def main(args):
                 show_tips=True,
                 )
 
+
 if __name__ == "__main__":
     # parsing arguments
     parser = argparse.ArgumentParser(description="Simple command-line calculator")
@@ -872,5 +1063,7 @@ if __name__ == "__main__":
                         action="store_true",
                         help="Interact with chatbot")
     args = parser.parse_args()
+
+    langchain.debug = True
 
     main(args)
