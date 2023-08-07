@@ -4,26 +4,31 @@ import io
 import time
 import functools
 import base64
-from typing import List
 import argparse
+from typing import List, Union, Literal
+from enum import Enum
+import re
 
 import gradio as gr
 from pydantic import BaseModel
 from dotenv import load_dotenv, find_dotenv
 from termcolor import colored
+import tiktoken
 
 import torch
 from torch import cuda, bfloat16
 from PIL import Image
 
 import langchain
-from langchain import OpenAI, LLMChain, PromptTemplate
-from langchain.llms import OpenAI
-from langchain.llms import HuggingFacePipeline
+from langchain import LLMChain, PromptTemplate
+from langchain.llms import OpenAI, HuggingFacePipeline
+from langchain.chat_models import ChatOpenAI
 from langchain.agents import ZeroShotAgent, AgentExecutor
 from langchain.tools import tool
 from langchain.tools.python.tool import PythonREPLTool
 from langchain.memory import ConversationBufferMemory
+from langchain.schema import HumanMessage
+from langchain.prompts import PromptTemplate
 
 import transformers
 from transformers import pipeline
@@ -137,8 +142,8 @@ class NER():
         | O             | Outside of a named entity
         | B-MIS         | Beginning of a miscellaneous entity right after another miscellaneous entity
         | I-MIS         | Miscellaneous entity
-        | B-PER         | Beginning of a person’s name right after another person’s name
-        | I-PER         | Person’s name
+        | B-PER         | Beginning of a person's name right after another person's name
+        | I-PER         | Person's name
         | B-ORG         | Beginning of an organization right after another organization
         | I-ORG         | organization
         | B-LOC         | Beginning of a location right after another location
@@ -260,7 +265,8 @@ class OpenAIModel():
 
         # load model
         self.load_tools()
-        self.load_agent_prompt()
+        self.load_agent_prompt_ReAct()
+        # self.load_agent_prompt_ReAct_Reflect()
         self.load_model()
 
         # load model
@@ -273,16 +279,13 @@ class OpenAIModel():
         @tool(return_direct=True)
         def standard_response(query: str) -> str:
             """ """
-            query_with_context = f"""\
-Reply the user with a friendly manner.
-User: {query}\
-"""
-            search_result = self.llm_text_model.predict(query_with_context)
-            return search_result
+            return query
         standard_response.description = """\
 If the user's request is not a question, \
 or just requires a standard response, \
-give a standard reply.\
+give a standard reply. \
+If the user's question is found in the chat history, \
+reply with the information from the chat history.\
 """
 
         # --- question_answer tool ---
@@ -311,7 +314,7 @@ If you want to see the output of a value, you should print it out with `print(..
         self.tool_descriptions = "\n\n".join([f"{i.name}: {i.description}" for i in self.tools_lst])
         # print(colored(self.tool_descriptions, 'blue'))
 
-    def load_agent_prompt(self):
+    def load_agent_prompt_ReAct(self):
         template = """\
 Have a conversation with a human, answering the following questions as best you can. \
 Find relevant information from the chat history if required. \
@@ -355,6 +358,110 @@ Thought: {agent_scratchpad}\
         # pdb.set_trace()
 
         self.prompt = PromptTemplate.from_template(template)
+        # print(colored(self.prompt.template, 'red'))
+
+    def load_agent_prompt_ReAct_Reflect(self):
+        """
+        Solve a question answering task with interleaving Thought, Action, Observation steps. Thought can reason about the current situation, and Action can be three types:
+        (1) Search[entity], which searches the exact entity on Wikipedia and returns the first paragraph if it exists. If not, it will return some similar entities to search.
+        (2) Lookup[keyword], which returns the next sentence containing keyword in the last passage successfully found by Search.
+        (3) Finish[answer], which returns the answer and finishes the task.
+        You may take as many steps as necessary.
+        Here are some examples:
+        {examples}
+        (END OF EXAMPLES)
+        Question: {question}{scratchpad}
+        """
+        """
+standard_response: If the user's request is not a question, or just requires a standard response, give a standard reply.
+
+question_answer: If the user's request requires information that is not found in the chat history, ask them to provide the information to you, instead of hallucinating the output.
+
+Python_REPL: A Python shell. Use this to execute python commands. Input should be a valid python command. Denote the python command with triple backticks. If you want to see the output of a value, you should print it out with `print(...)`.
+        """
+
+        template = f"""\
+Solve a question answering task with interleaving Thought, Action, Action Input, Observation steps.
+Thought can reason about the current situation.
+Action can be {len(self.tool_descriptions)} types: 
+```
+{self.tool_descriptions}
+```
+Action Input is the input to the Action.
+Observation the output of the result
+
+Once the process is done and achieved final output, return the final answer like this
+Final Answer: <insert final answer to the original input question>
+"""
+        
+        examples = """
+Question: Hi
+Thought: This is a standard greeting
+Action: standard_response
+Action Input: Hi
+Observation: Hello !
+Thought: I now know the final answer
+Final Answer: the final answer to the original input question
+
+Question: What is the elevation range of my custom equipment?
+Thought: I first need to know the lower bound of the custom equipment.
+Action: question_answer
+Action Input: What is the lower bound of the custom equipment ? 
+
+Question: It is 10 feet
+Thought: Next, i need to know the upper bound of the custom equipment.
+Action: question_answer
+Action Input: What is the upper bound of the custom equipment ? 
+
+Question: It is 20 feet
+Thought: I now know the final answer
+Final Answer: 10 feet to 20 feet.
+"""
+        
+        examples = """
+
+Question: What is the cosine of the number of characters of my name ?
+
+Thought: First, I need to ask the user for their name
+Action: question_answer
+Action Input: What is your name?
+Observation: What is your name?
+
+Question: my name is leonard
+Thought: i need to count the number of chracters of leonard, and then compute the cosine of it
+Action: Python_REPL
+Action Input: ```
+import math
+name = 'leonard'
+length_of_name = len(name)
+print(math.cos(length_of_name))
+```
+Observation: 0.7539022543433046
+
+Thought: I now know the final answer
+Final Answer: The cosine of the number of characters of your name is 0.7539022543433046
+
+"""
+        template += f"""\
+You may take as many steps as necessary.
+Here are some examples:
+{examples}
+(END OF EXAMPLES)
+"""
+        template += """\
+Question: {question}
+Thought: {agent_scratchpad}"""
+
+        # react_agent_prompt = PromptTemplate(
+        #                         input_variables=["question", "scratchpad"],
+        #                         template = template,
+        #                         )
+
+        print(colored(template, 'blue'))
+        # print(colored(react_agent_prompt, 'red'))
+        # pdb.set_trace()
+
+        self.prompt = PromptTemplate.from_template(template)
 
     def load_model(self):
         # Load tokenizer
@@ -377,17 +484,24 @@ Thought: {agent_scratchpad}\
         )
 
         # example of how to run the sequence with look back on memory
-        # self.agent_chain.run("hi")
-        # self.agent_chain.run("my name is leonard")
-        # self.agent_chain.run("whats my name ?")
-        # self.agent_chain.run("whats my age ?")
-        # self.agent_chain.run("whats my age ?")
-        # self.agent_chain.run("whats my age multiplied by 5 ?")
-        # self.agent_chain.run("whats my wife's age multiplied by 5 ?")
-        # self.agent_chain.run("whats my wife's age ?")
-        # self.agent_chain.run("why do you think so ?")
-        # self.agent_chain.run("Summarise our chat history please")
-        # self.agent_chain.run("what is our combined age divided by 8 ?")
+        """
+        print(self.agent_chain.agent.llm_chain.prompt.template)
+        langchain.debug = False
+        self.agent_chain.run("hi, my name is leonard")
+        self.agent_chain.run("whats my name ?")
+        self.agent_chain.run("whats my age ?")
+        self.agent_chain.run("whats my age ?")
+        self.agent_chain.run("31")
+        self.agent_chain.run("31 years old")
+        self.agent_chain.run("whats my age multiplied by 5 ?")
+        self.agent_chain.run("whats my wife's age multiplied by 5 ?")
+        self.agent_chain.run("her age is 29 years old")
+        self.agent_chain.run("get the answer from the chat history")
+        self.agent_chain.run("whats my wife's age ?")
+        self.agent_chain.run("why do you think so ?")
+        self.agent_chain.run("Summarise our chat history please")
+        self.agent_chain.run("what is our combined age divided by 8 ?")
+        """
         # pdb.set_trace()
 
     # ----- v1 -----
@@ -778,6 +892,374 @@ Refer to the context denoted by triple backticks:
 
         return "", self.chat_history
 
+class CoTAgent_Reflect:
+    def __init__(self) -> None:
+        self.question = None # question
+        self.context = "" # context
+        self.chat_history = [] # list of tuples containing past chat histories
+        self.temperature = 0.1
+
+        self.load_action_prompts()
+        self.load_reflection_prompts()
+        self.system_prompt = self.agent_prompt.template
+
+        self.tokenizer = tiktoken.encoding_for_model("text-davinci-003")
+
+        self.answer = ''
+        self.step_n: int = 0
+
+        self.reset()
+
+
+    class AnyOpenAILLM:
+        def __init__(self, *args, **kwargs):
+            # Determine model type from the kwargs
+            model_name = kwargs.get('model_name', 'gpt-3.5-turbo') 
+            if model_name.split('-')[0] == 'text':
+                self.model = OpenAI(*args, **kwargs)
+                self.model_type = 'completion'
+            else:
+                self.model = ChatOpenAI(*args, **kwargs)
+                self.model_type = 'chat'
+        
+        def __call__(self, prompt: str):
+            if self.model_type == 'completion':
+                return self.model(prompt)
+            else:
+                return self.model(
+                    [
+                        HumanMessage(
+                            content=prompt,
+                        )
+                    ]
+                ).content
+
+    class ReflexionStrategy(Enum):
+        """
+        NONE: No reflection
+        LAST_ATTEMPT: Use last reasoning trace in context 
+        REFLEXION: Apply reflexion to the next reasoning trace 
+        LAST_ATTEMPT_AND_REFLEXION: Use last reasoning trace in context and apply reflexion to the next reasoning trace 
+        """
+        NONE = 'base'
+        LAST_ATTEMPT = 'last_trial' 
+        REFLEXION = 'reflexion'
+        LAST_ATTEMPT_AND_REFLEXION = 'last_trial_and_reflexion'
+
+    def load_action_prompts(self):
+        # Prompt format
+        COT_AGENT_REFLECT_INSTRUCTION_LL = """\
+Solve a question answering task by having a Thought, Action, then Finish with your answer.
+
+Thought can reason about the current situation.
+Action must follow either of the following format: 
+(1) Ask_User[question], which returns the assistant generated question to ask the user before completing the previous task.
+(2) Finish[answer], which returns the answer and finishes the task. If there are no action required, be a friendly assistant.
+Ensure the Action is of the format: `xxx[yyy]`
+
+You will be given context that you should use to help you answer the question. If not context are available, do not hallucinate an answer.
+
+Here are some examples:
+{examples}
+(END OF EXAMPLES)
+
+{reflections}
+
+Relevant Context: {context}
+Question: {question}{scratchpad}"""
+        cot_reflect_agent_prompt_LL = PromptTemplate(
+                                input_variables=["examples", "reflections", "context", "question", "scratchpad"],
+                                template = COT_AGENT_REFLECT_INSTRUCTION_LL,
+                                )
+        self.agent_prompt = cot_reflect_agent_prompt_LL
+
+        # fewshot examples
+        COT_LL = """Relevant Context: The Nile River is the longest river in the world, spanning approximately 6,650 kilometers (4,132 miles) in length. It flows through eleven countries in northeastern Africa, including Egypt, Sudan, and Uganda.
+Question: What is the longest river in the world?
+Thought: The question asks for the longest river in the world, which I know is the Nile River based on the context provided.
+Action: Finish[Nile River]
+
+Relevant Context: Ripe banana is yellow in colour.
+Question: How many characters are there in my name?
+Thought: From the context, there is no information about the user's name, so i cannot count the number of characters. I need to ask the user's for their name first.
+Action: Ask_User[First, i'll need to know your name. What is your name ?]
+"""
+        self.cot_examples = COT_LL 
+
+        # llm for action inference
+        self.action_llm = self.AnyOpenAILLM(temperature=self.temperature, 
+                                       max_tokens=250, 
+                                       model_name="gpt-3.5-turbo", 
+                                       model_kwargs={"stop": "\n"}, 
+                                       openai_api_key=os.environ['OPENAI_API_KEY'])
+
+    def load_reflection_prompts(self):
+        # Prompt format
+        COT_REFLECT_INSTRUCTION = """\
+You are an advanced reasoning agent that can improve based on self reflection.
+You will be given a previous reasoning trial in which you were given access to relevant context and a question to answer. \
+You might be unsuccessful in answering the question either because you guessed the wrong answer with Finish[<answer>]. \
+In a few sentences, \
+diagnose a possible reason for failure or phrasing discrepancy and \
+devise a new, concise, high level plan that aims to mitigate the same failure. \
+Use complete sentences. \
+When diagnosing `Ask_User`, do not reply by with `Waiting for user response`.
+
+Here are some examples:
+{examples}
+(END OF EXAMPLES)
+
+Previous trial:
+Relevant Context: {context}
+Question: {question}{scratchpad}
+
+Reflection:"""
+        cot_reflect_prompt = PromptTemplate(
+                        input_variables=["examples", "context", "question", "scratchpad"],
+                        template = COT_REFLECT_INSTRUCTION,
+                        )
+        self.reflect_prompt = cot_reflect_prompt
+
+        # fewshot examples
+        COT_REFLECT_LL = """\
+Relevant Context: Ernest Hemingway's novel "The Old Man and the Sea" tells the story of Santiago, an aging Cuban fisherman, who struggles to catch a giant marlin in the Gulf Stream. The book won the Pulitzer Prize for Fiction in 1953 and contributed to Hemingway's Nobel Prize for Literature in 1954.
+Question: Which literary award did "The Old Man and the Sea" contribute to Hemingway winning?
+Thought: The question is asking which award "The Old Man and the Sea" contributed to Hemingway winning. Based on the context, I know the novel won the Pulitzer Prize for Fiction and contributed to his Nobel Prize for Literature.
+Action: Finish[Pulitzer Prize for Fiction]
+
+Reflection: My answer was correct based on the context, but may not be the exact answer stored by the grading environment. \
+Next time, I should try to provide a less verbose answer like "Pulitzer Prize" or "Nobel Prize."
+
+Context: On 14 October 1947, Chuck Yeager, a United States Air Force test pilot, became the first person to break the sound barrier by flying the Bell X-1 experimental aircraft at an altitude of 45,000 feet.
+Charles Elwood "Chuck" Yeager (13 February 1923 - 7 December 2020) was a United States Air Force officer, flying ace, and test pilot. He is best known for becoming the first person to break the sound barrier, which he achieved in the Bell X-1 aircraft named Glamorous Glennis. Yeager was also a distinguished fighter pilot during World War II and was credited with shooting down at least 12 enemy aircraft. In 1973, he was inducted into the National Aviation Hall of Fame for his significant contributions to aviation.
+Question: Who is the first person to break the sound barrier?
+Thought: The question is asking for the first person to break the sound barrier. From the context, I know that Chuck Yeager, a United States Air Force test pilot, was the first person to break the sound barrier.
+Action: Finish[Chuck Yeager]
+
+Reflection: Upon reflecting on the incorrect answer I provided, I realize that I may not have given the full name of the individual in question. In the context, both the given name and the nickname were mentioned, and I only used the nickname in my response. This could have been the reason my answer was deemed incorrect. Moving forward, when attempting this question again or similar questions, I will make sure to include the complete name of the person, which consists of their given name, any middle names, and their nickname (if applicable). This will help ensure that my answer is more accurate and comprehensive.
+
+Context: The novel "To Kill a Mockingbird" was written by Harper Lee and published in 1960. The story takes place in the fictional town of Maycomb, Alabama during the Great Depression. The main characters are Scout Finch, her brother Jem, and their father Atticus Finch, a lawyer.
+Question: How many childen does the child of the author have?
+Thought: The user is asking for the number of children of the child of the author, but the author has one son and one daughter. To answer this question, I need to know which son the user is referring to. I should ask the user first.
+Action: Ask_User[Which son are u talking about?]
+Thought: The assistant is asking the user which son of the author that the user is enquiring about.
+
+Reflection: My request was incorrect because the user was asking about a child, but i asked the user which son instead. \
+After reevaluating the context, I realized that the user was asking about a child, not the son or the daughter. \
+My confusion may have stemmed from the fact that the son are child of the author. \
+Next time, I should be more cautious and not to assume an entity when there might be multiple entities involved.\
+"""
+        self.reflect_examples = COT_REFLECT_LL
+
+        # llm for reflect inference
+        self.self_reflect_llm = self.AnyOpenAILLM(
+                                            temperature=0,
+                                            max_tokens=250,
+                                            model_name="gpt-3.5-turbo",
+                                            model_kwargs={"stop": "\n"},
+                                            openai_api_key=os.environ['OPENAI_API_KEY'])
+
+        # reflections
+        self.REFLECTION_HEADER = """\
+You have attempted to answer following question before and might have failed. \
+The following reflection(s) give a plan to avoid failing to answer the question in the same way you did previously. \
+Use them to improve your strategy of correctly answering the given question.
+"""
+        self.reflections: List[str] = []
+        self.reflections_str = ''
+
+
+    def respond(self,
+            question: str,
+            dummy_chat_history: List[tuple]
+            ) -> None:
+        self.question = question
+        print(colored(f"\n## {self.question}", 'red'))
+
+        # Initial Inference
+        self.reset()
+        self.step()
+
+        # Reflect
+        self.reflect(self.ReflexionStrategy.REFLEXION)
+        self.step()
+
+        # Chat history becomes context
+        self.context += f"User: {self.question}\n"
+        self.context += f"Assistant: {self.answer}\n"
+        self.chat_history.append((self.question, self.answer))
+
+        self.step_n += 1
+        suggested_answer = ""
+        return suggested_answer, self.chat_history
+
+    def respond_with_options_Reflexion(self,
+            question: str,
+            dummy_chat_history: List[tuple],
+            system_prompt, 
+            temperature,
+            ) -> None:
+        self.question = question
+        print(colored(f"\n## {self.question}", 'red'))
+
+        # Initial Inference
+        self.reset()
+        self.step()
+
+        # Reflect
+        self.reflect(self.ReflexionStrategy.REFLEXION)
+        self.step()
+
+        # Chat history becomes context
+        self.context += f"User: {self.question}\n"
+        self.context += f"Assistant: {self.answer}\n"
+        self.chat_history.append((self.question, self.answer))
+
+        self.step_n += 1
+        suggested_answer = ""
+        return suggested_answer, self.chat_history
+
+    def step(self) -> None:
+        # Thought
+        self.scratchpad += f'\nThought:'
+        self.scratchpad += ' ' + self.prompt_agent()
+        print_string = self.scratchpad.split('\n')[-1]
+        print(colored(f"## {print_string}", 'yellow'))
+
+
+        # Action
+        self.scratchpad += f'\nAction:'
+        action = self.prompt_agent()
+        self.scratchpad += ' ' + action
+        try:
+            action_type, argument = self.parse_action(action)
+        except Exception as e:
+            pdb.set_trace()
+        print_string = self.scratchpad.split('\n')[-1]
+        print(colored(f"## {print_string}", 'blue'))
+        # print(f"self.scratchpad: {self.scratchpad}")
+
+        # Observation
+        self.scratchpad += f'\nObservation: '
+        if action_type == 'Finish':
+            self.answer = argument
+            self.scratchpad += argument
+            self.finished = True
+            print_string = self.scratchpad.split('\n')[-1]
+            print(colored(f"## {print_string}", 'green'))
+            return
+        elif action_type == 'Ask_User':
+            self.answer = argument
+            self.scratchpad += argument
+            self.finished = True
+            print_string = self.scratchpad.split('\n')[-1]
+            print(colored(f"## {print_string}", 'green'))
+            return
+        else:
+            print('Invalid action type, please try again.')
+
+    def reflect(self,
+                strategy: Enum) -> None:
+        print('Running Reflexion strategy...')
+        if strategy == self.ReflexionStrategy.LAST_ATTEMPT:
+            LAST_TRIAL_HEADER = 'You have attempted to answer the following question before and failed. Below is the last trial you attempted to answer the question.\n'
+            self.reflections = [self.scratchpad]
+            self.reflections_str = self.format_last_attempt(self.question,
+                                                            self.reflections[0],
+                                                            LAST_TRIAL_HEADER)
+        elif strategy == self.ReflexionStrategy.REFLEXION:
+            REFLECTION_HEADER = 'You have attempted to answer following question before and failed. The following reflection(s) give a plan to avoid failing to answer the question in the same way you did previously. Use them to improve your strategy of correctly answering the given question.\n'
+            self.reflections += [self.prompt_reflection()]
+            self.reflections_str = self.format_reflections(self.reflections, REFLECTION_HEADER)
+        elif strategy == self.ReflexionStrategy.LAST_ATTEMPT_AND_REFLEXION:
+            REFLECTION_AFTER_LAST_TRIAL_HEADER = 'The following reflection(s) give a plan to avoid failing to answer the question in the same way you did previously. Use them to improve your strategy of correctly answering the given question.\n'
+            self.reflections_str = self.format_last_attempt(self.question , self.scratchpad, LAST_TRIAL_HEADER)
+            self.reflections = [self.prompt_reflection()]
+            self.reflections_str += '\n'+ self.format_reflections(self.reflections, 
+                                                                  header = REFLECTION_AFTER_LAST_TRIAL_HEADER)
+        else:
+            raise NotImplementedError(f'Unknown reflection strategy: {strategy}')
+        print(f'reflections_str = {self.reflections_str}')
+
+
+    def prompt_agent(self) -> str:
+        return self.format_step(
+                            self.action_llm(
+                                            self._build_agent_prompt()
+                                            )
+                            )
+
+    def prompt_reflection(self) -> str:
+        return self.format_step(
+                            self.self_reflect_llm(
+                                                self._build_reflection_prompt()
+                                                )
+                            )
+
+    def reset(self) -> None:
+        self.scratchpad: str = ''
+        self.finished = False
+
+
+    def _build_agent_prompt(self) -> str:
+        return self.agent_prompt.format(
+                            examples = self.cot_examples,
+                            reflections = self.reflections_str,
+                            context = self.context,
+                            question = self.question,
+                            scratchpad = self.scratchpad)
+
+    def _build_reflection_prompt(self) -> str:
+        return self.reflect_prompt.format(
+                            examples = self.reflect_examples,
+                            context = self.context,
+                            question = self.question,
+                            scratchpad = self.scratchpad)
+ 
+    def is_finished(self) -> bool:
+        return self.finished
+
+
+    def parse_action(self, string):
+        pattern = r'^(\w+)\[(.+)\]$'
+        match = re.match(pattern, string)
+
+        if match:
+            action_type = match.group(1)
+            argument = match.group(2)
+            return action_type, argument
+        
+        else:
+            return None
+
+    def format_step(self, step: str) -> str:
+        return step.strip('\n').strip().replace('\n', '')
+
+    def format_reflections(self, 
+                           reflections: List[str],
+                           header: str = ''
+                           ) -> str:
+        if reflections == []:
+            return ''
+        else:
+            return header + 'Reflections:\n- ' + '\n- '.join([r.strip() for r in reflections])
+
+    def format_last_attempt(self,
+                            question: str,
+                            scratchpad: str,
+                            header: str = ''):
+        return header + f'Question: {question}\n' + self.truncate_scratchpad(scratchpad, tokenizer=self.tokenizer).strip('\n').strip() + '\n(END PREVIOUS TRIAL)\n'
+
+    def truncate_scratchpad(self, scratchpad: str, n_tokens: int = 1600, tokenizer: tiktoken.encoding_for_model = None) -> str:
+        lines = scratchpad.split('\n')
+        observations = filter(lambda x: x.startswith('Observation'), lines)
+        observations_by_tokens = sorted(observations, key=lambda x: len(tokenizer.encode(x)))
+        while len(self.tokenizer.encode('\n'.join(lines))) > n_tokens:
+            largest_observation = observations_by_tokens.pop(-1)
+            ind = lines.index(largest_observation)
+            lines[ind] = largest_observation.split(':')[0] + ': [truncated wikipedia excerpt]'
+        return '\n'.join(lines)
+
 
 @debug_on_error
 def main(args):
@@ -803,12 +1285,13 @@ def main(args):
         image_generation = ImageGeneration(model_name_ImageCaption, use_cuda=args.run_image_generation_cuda)
     # ----- ChatBot -----
     if args.run_ChatBot:
-        model_name = "google/flan-t5-base"
-        chat_bot = OpenAIModel(model_name)
+        # model_name = "google/flan-t5-base"
+        # chat_bot = OpenAIModel(model_name)
         # model_name = "google/flan-t5-base"
         # chat_bot = ChatModel(model_name)
         # model_name_ChatBot = "meta-llama/Llama-2-7b-chat-hf" # https://huggingface.co/meta-llama/Llama-2-7b-chat-hf
         # chat_bot = LlamaModel(model_name_ChatBot)
+        chat_bot = CoTAgent_Reflect()
 
 
     # Gradio Interfaces
@@ -992,7 +1475,7 @@ def main(args):
             btn.click(fn=image_generation.generate, inputs=[prompt,negative_prompt,steps,guidance,width,height], outputs=[output])
         # """
     elif args.run_ChatBot:
-        # v1: limited features
+        # --- v1 ---: limited features
         with gr.Blocks() as demo:
             chatbot = gr.Chatbot(height=240) #just to fit the notebook
             msg = gr.Textbox(label="Prompt")
@@ -1002,12 +1485,14 @@ def main(args):
             btn.click(chat_bot.respond, inputs=[msg, chatbot], outputs=[msg, chatbot])
             msg.submit(chat_bot.respond, inputs=[msg, chatbot], outputs=[msg, chatbot]) # Press enter to submit
 
-        # v2: use chat history as context
+        # --- v2 ---: use chat history as context
         # chat_bot_function = chat_bot.respond_with_options
-        # v3: summarise chat history and use it as context
+        # --- v3 ---: summarise chat history and use it as context
         # chat_bot_function = chat_bot.respond_with_options_summarised_chat
-        # v4: Use ReAct
-        chat_bot_function = chat_bot.respond_with_options_ReAct
+        # --- v4 ---: ReAct
+        # chat_bot_function = chat_bot.respond_with_options_ReAct
+        # --- v4 ---: Reflexion
+        chat_bot_function = chat_bot.respond_with_options_Reflexion
         with gr.Blocks() as demo:
             # chat history
             chatbot = gr.Chatbot(height=400)
@@ -1024,7 +1509,6 @@ def main(args):
             btn = gr.Button("Submit")
             clear = gr.ClearButton(components=[msg, chatbot],
                                    value="Clear console")
-
             btn.click(chat_bot_function,
                       inputs=[msg, chatbot, system_prompt, temperature],
                       outputs=[msg, chatbot])
@@ -1065,5 +1549,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     langchain.debug = True
+    langchain.debug = False
 
     main(args)
